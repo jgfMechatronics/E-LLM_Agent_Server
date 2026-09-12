@@ -16,7 +16,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from agent.types import BlockSettings
 from conftest import make_deps, SAMPLE_AGENT_CONFIG
 from db.models import AgentRecord, MemoryBlockRecord
-from memory.block_crud import DuplicateBlockError
 
 from memory import block_crud
 from memory.block_crud import (
@@ -29,6 +28,8 @@ from memory.block_crud import (
     reorder_blocks,
     BlockNotFoundError,
     ContentExceedsLimitError,
+    DuplicateBlockError,
+    DuplicatePositionError,
     InvalidBlockOrderListError,
 )
 
@@ -252,12 +253,12 @@ class TestUpdateBlockSettings:
             await update_block_settings(self.deps, "persona", new_settings)
 
     async def test_duplicate_position_raises(self):
-        """Setting position to one already used should raise IntegrityError."""
+        """Setting position to one already used should raise DuplicatePositionError."""
         # "persona" is at position 0, "human" is at position 1
         # Try to move "human" to position 0
         new_settings = BlockSettings(label="human", description="", char_limit=20000, position=0)
         
-        with pytest.raises(IntegrityError):
+        with pytest.raises(DuplicatePositionError):
             await update_block_settings(self.deps, "human", new_settings)
 
     async def test_rejects_char_limit_below_content_length(self):

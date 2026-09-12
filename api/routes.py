@@ -37,7 +37,6 @@ from api.schemas import (
 )
 from memory.block_crud import (
     ContentExceedsLimitError,
-    DuplicateBlockError,
     InvalidBlockOrderListError,
     create_block,
     get_block,
@@ -252,10 +251,7 @@ async def create_memory_block(
         )
     except ValidationError as e:
         raise HTTPException(status_code=422, detail=f"Invalid block settings: {e}") from e
-    try:
-        block = await create_block(deps, settings, body.content)
-    except DuplicateBlockError as e:
-        raise HTTPException(status_code=422, detail=f"Duplicate block: {e}") from e
+    block = await create_block(deps, settings, body.content)
     return MemoryBlockResponse.from_record(block)
 
 
@@ -295,10 +291,7 @@ async def put_block_settings(
     deps: AgentDeps = Depends(get_agent_deps),
 ) -> BlockSettings:
     """Update settings/metadata for a memory block."""
-    try:
-        block = await update_block_settings(deps, label, settings)
-    except DuplicateBlockError as e:
-        raise HTTPException(status_code=422, detail=str(e)) from e
+    block = await update_block_settings(deps, label, settings)
     return BlockSettings.from_record(block)
 
 

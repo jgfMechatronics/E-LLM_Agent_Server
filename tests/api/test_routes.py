@@ -574,24 +574,7 @@ class TestCreateMemoryBlock(_MemoryBlockEndpointBase):
         assert MemoryBlockResponse.model_validate(response.json()) == MemoryBlockResponse.from_record(mock_block_record)
 
     # 404 tested via parametrized TestNotFound
-
-    async def test_returns_422_for_duplicate_block(self, client: AsyncClient):
-        """
-        Returns 422 with label in detail when block label already exists.
-        This one is mapped internally by the route since this is the only place we expect it to occur....
-        
-        TODO: The above could be wrong, what if the agent tries to make a duplicate block with a tool call (future intended tool)?
-        Then handle_message could raise this exception! Consider moving to an app level handler like some of the others
-        """
-        self.mock_create_block.side_effect = DuplicateBlockError("block with label 'notes' already exists")
-
-        response = await client.post(
-            f"/agents/{self.agent_record.id}/memory/blocks",
-            json=self._VALID_BODY,
-        )
-
-        assert response.status_code == 422
-        assert response.json()["detail"] == "Duplicate block: block with label 'notes' already exists"
+    # 422 for Duplicate block handled by app level handler + test
 
     async def test_returns_422_for_invalid_settings(self, client: AsyncClient):
         """Returns 422 when BlockSettings validation fails (e.g., char_limit <= 0)."""
@@ -776,19 +759,7 @@ class TestUpdateBlockSettings(_MemoryBlockEndpointBase):
             json=invalid_body,
         )
 
-        assert response.status_code == 422  # FastAPI validation, not our 400
-
-    async def test_returns_422_for_duplicate_label(self, client: AsyncClient):
-        """Returns 422 when renaming to a label that already exists."""
-        self.mock_update_block_settings.side_effect = DuplicateBlockError("block with label 'human' already exists")
-
-        response = await client.put(
-            f"/agents/{self.agent_record.id}/memory/blocks/persona/settings",
-            json={"label": "human", "description": "", "char_limit": 20000},
-        )
-
-        assert response.status_code == 422
-        assert "already exists" in response.json()["detail"]
+        assert response.status_code == 422  # FastAPI validation
 
 
 class TestReorderBlocks(_MemoryBlockEndpointBase):

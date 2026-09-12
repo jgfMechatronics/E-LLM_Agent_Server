@@ -17,6 +17,7 @@ to be read only BUT they do still get a full session. Is there a such thing as a
 from collections.abc import Sequence
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent.types import AgentDeps, BlockSettings
@@ -39,6 +40,10 @@ class ContentExceedsLimitError(Exception):
 
 class InvalidBlockOrderListError(Exception):
     """Raised when the label list for reorder doesn't match the agent's blocks."""
+
+
+class DuplicatePositionError(Exception):
+    """Raised when attempting to set a block's position to one already held by another block."""
 
 
 # --- Internal helpers ---
@@ -222,21 +227,32 @@ async def update_block_settings(
     
     Raises BlockNotFoundError if block doesn't exist.
     Raises DuplicateBlockError if renaming to a label that already exists.
+    Raises DuplicatePositionError if setting position to one already held by another block.
     """
     block = await get_block_or_raise(deps.session, deps.agent_id, label)
     
-    # Check for label conflict on rename
+    # Check for label conflict on rename (before mutations)
     if settings.label != label:
         await raise_if_label_exists(deps.session, deps.agent_id, settings.label)
     
     if settings.char_limit < len(block.content):
         raise ContentExceedsLimitError("new char_limit is less than current content length")
     
+    # Apply mutations
     block.label = settings.label
     block.description = settings.description
     block.char_limit = settings.char_limit
     if settings.position is not None:
         block.position = settings.position
+
+    try:
+        await _persist(deps, commit, block)
+    except IntegrityError as e:
+        # Label conflict already checked above; check for position conflict
+        if "UNIQUE constraint failed: memory_block.agent_id, memory_block.position" in str(e):
+            raise DuplicatePositionError(
+                f"position {settings.position} already held by another block"
+            ) from e
+        raise  # Re-raise unexpected IntegrityErrors
     
-    await _persist(deps, commit, block)
     return block
