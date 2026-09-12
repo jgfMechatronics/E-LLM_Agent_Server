@@ -295,7 +295,10 @@ async def put_block_settings(
     deps: AgentDeps = Depends(get_agent_deps),
 ) -> BlockSettings:
     """Update settings/metadata for a memory block."""
-    block = await update_block_settings(deps, label, settings)
+    try:
+        block = await update_block_settings(deps, label, settings)
+    except DuplicateBlockError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
     return BlockSettings.from_record(block)
 
 

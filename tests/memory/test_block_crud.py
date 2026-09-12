@@ -244,11 +244,11 @@ class TestUpdateBlockSettings:
         assert BlockSettings.from_record(fetched) == expected
 
     async def test_duplicate_label_raises(self):
-        """Renaming to an existing label should raise IntegrityError."""
+        """Renaming to an existing label should raise DuplicateBlockError."""
         # Try to rename "persona" to "human" (which exists)
         new_settings = BlockSettings(label="human", description="", char_limit=20000)
         
-        with pytest.raises(IntegrityError):
+        with pytest.raises(DuplicateBlockError):
             await update_block_settings(self.deps, "persona", new_settings)
 
     async def test_duplicate_position_raises(self):

@@ -80,6 +80,21 @@ async def get_block(session: AsyncSession, agent_id: str, label: str) -> MemoryB
     return result.scalars().one_or_none()
 
 
+async def get_block_or_raise(session: AsyncSession, agent_id: str, label: str) -> MemoryBlockRecord:
+    """Load single block by label. Raises BlockNotFoundError if not found."""
+    block = await get_block(session, agent_id, label)
+    if block is None:
+        raise BlockNotFoundError(f"block with label '{label}' not found")
+    return block
+
+
+async def raise_if_label_exists(session: AsyncSession, agent_id: str, label: str) -> None:
+    """Raise DuplicateBlockError if a block with this label already exists."""
+    existing = await get_block(session, agent_id, label)
+    if existing is not None:
+        raise DuplicateBlockError(f"block with label '{label}' already exists")
+
+
 # --- Write operations (require deps → lock held) ---
 
 async def update_block(
@@ -98,9 +113,7 @@ async def update_block(
     already has it
     """
     if block is None:
-        block = await get_block(deps.session, deps.agent_id, label)
-        if block is None:
-            raise BlockNotFoundError(f"block with label '{label}' not found")
+        block = await get_block_or_raise(deps.session, deps.agent_id, label)
 
     if len(content) > block.char_limit:
         raise ContentExceedsLimitError("new content exceeds char limit")
@@ -122,10 +135,7 @@ async def create_block(
     If settings.position is None, appends to end (max existing position + 1).
     Raises if label already exists for this agent.
     """
-    # Check for duplicate label
-    existing = await get_block(deps.session, deps.agent_id, settings.label)
-    if existing is not None:
-        raise DuplicateBlockError(f"block with label '{settings.label}' already exists")
+    await raise_if_label_exists(deps.session, deps.agent_id, settings.label)
 
     # Auto-assign position if not specified
     position = settings.position
@@ -152,10 +162,7 @@ async def create_block(
 
 async def delete_block(deps: AgentDeps, label: str, commit: bool = True) -> None:
     """Remove block. Raises if block doesn't exist (fail loudly)."""
-    block = await get_block(deps.session, deps.agent_id, label)
-    if block is None:
-        raise BlockNotFoundError(f"block with label '{label}' not found")
-
+    block = await get_block_or_raise(deps.session, deps.agent_id, label)
     await deps.session.delete(block)
     await _persist(deps, commit)
 
@@ -214,10 +221,13 @@ async def update_block_settings(
     If settings.position is None, keeps the current position (no change).
     
     Raises BlockNotFoundError if block doesn't exist.
+    Raises DuplicateBlockError if renaming to a label that already exists.
     """
-    block = await get_block(deps.session, deps.agent_id, label)
-    if block is None:
-        raise BlockNotFoundError(f"block with label '{label}' not found")
+    block = await get_block_or_raise(deps.session, deps.agent_id, label)
+    
+    # Check for label conflict on rename
+    if settings.label != label:
+        await raise_if_label_exists(deps.session, deps.agent_id, settings.label)
     
     if settings.char_limit < len(block.content):
         raise ContentExceedsLimitError("new char_limit is less than current content length")

@@ -778,6 +778,18 @@ class TestUpdateBlockSettings(_MemoryBlockEndpointBase):
 
         assert response.status_code == 422  # FastAPI validation, not our 400
 
+    async def test_returns_422_for_duplicate_label(self, client: AsyncClient):
+        """Returns 422 when renaming to a label that already exists."""
+        self.mock_update_block_settings.side_effect = DuplicateBlockError("block with label 'human' already exists")
+
+        response = await client.put(
+            f"/agents/{self.agent_record.id}/memory/blocks/persona/settings",
+            json={"label": "human", "description": "", "char_limit": 20000},
+        )
+
+        assert response.status_code == 422
+        assert "already exists" in response.json()["detail"]
+
 
 class TestReorderBlocks(_MemoryBlockEndpointBase):
     """Tests for PUT /agents/{agent_id}/memory/blocks/order"""
