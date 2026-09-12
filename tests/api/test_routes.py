@@ -27,13 +27,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 # Local
 from agent.factory import AgentNotFoundError, LOCK_TIMEOUT_FAST
-from agent.types import AgentAppState, AgentConfig, AgentDeps
+from agent.types import AgentAppState, AgentConfig, AgentDeps, BlockSettings
 from api.fastapi_deps import get_agent_deps
 from agent.crud import create_agent_record
 from conftest import make_deps, SAMPLE_AGENT_CONFIG
 from db.models import AgentRecord, MemoryBlockRecord, utcnow
 from api.schemas import AgentMetadataResponse, CoreMemoryResponse, MemoryBlockResponse
-from memory.block_crud import DuplicateBlockError
+from memory.block_crud import BlockNotFoundError, ContentExceedsLimitError, DuplicateBlockError, InvalidBlockOrderListError
 
 
 # --- Test Classes ---
@@ -339,6 +339,30 @@ class TestGetMemoryBlocks:
     # 404 tested via parametrized test_get_endpoints_return_404_for_unknown_agent
 
 
+class TestGetMemoryBlock:
+    """GET /agents/{agent_id}/memory/blocks/{label} — single memory block."""
+
+    async def test_returns_single_block(self, client: AsyncClient, agent_with_blocks: dict):
+        """Returns the requested memory block."""
+        agent = agent_with_blocks["agent"]
+        block = agent_with_blocks["blocks"][0]
+
+        response = await client.get(f"/agents/{agent.id}/memory/blocks/{block.label}")
+
+        assert response.status_code == 200
+        actual = MemoryBlockResponse.model_validate(response.json())
+        expected = MemoryBlockResponse.from_record(block)
+        assert actual == expected
+
+    async def test_returns_404_for_nonexistent_block(self, client: AsyncClient, agent_record: AgentRecord):
+        """Returns 404 when block label doesn't exist."""
+        response = await client.get(f"/agents/{agent_record.id}/memory/blocks/nonexistent")
+
+        assert response.status_code == 404
+
+    # 404 for unknown agent tested via parametrized test_get_endpoints_return_404_for_unknown_agent
+
+
 @pytest.mark.xfail(reason="get_messages endpoint format TBD — will be reworked once coding CLI/harness is selected")
 class TestGetMessages:
     """
@@ -417,7 +441,11 @@ _VALID_CONFIG_BODY = {
 }
 _PUT_ENDPOINT_PARAMS = [
     ("/agents/{agent_id}/config", _VALID_CONFIG_BODY),
-    ("/agents/{agent_id}/system-instructions", "some instructions"),
+    ("/agents/{agent_id}/system-instructions", {"system_instructions": "some instructions"}),
+    # Memory block routes
+    ("/agents/{agent_id}/memory/blocks/some-label/content", {"content": "new content"}),
+    ("/agents/{agent_id}/memory/blocks/some-label/settings", {"description": "new desc"}),
+    ("/agents/{agent_id}/memory/blocks/order", ["label1", "label2"]),
 ]
 
 
@@ -427,9 +455,11 @@ class TestNotFound:
     @pytest.mark.parametrize("path", [
         "/agents/{agent_id}",
         "/agents/{agent_id}/memory/blocks",
+        "/agents/{agent_id}/memory/blocks/some-label",
         "/agents/{agent_id}/messages",
         "/agents/{agent_id}/config",
         "/agents/{agent_id}/system-instructions",
+        "/agents/{agent_id}/memory/blocks/some-label/settings",
     ])
     async def test_get_endpoints_return_404_for_unknown_agent(self, client: AsyncClient, path: str):
         """All GET endpoints with agent_id return 404 for unknown agents."""
@@ -444,6 +474,18 @@ class TestNotFound:
         """All PUT endpoints with agent_id return 404 for unknown agents."""
         url = path.format(agent_id=uuid4())
         response = await client.put(url, json=body)
+        assert response.status_code == 404
+
+    @pytest.mark.parametrize("path,body", [
+        ("/agents/{agent_id}/memory/blocks", {"label": "test", "content": "content"}),
+        # TODO: Add more POST endpoints as they're created
+    ])
+    async def test_post_endpoints_return_404_for_unknown_agent(
+        self, client: AsyncClient, path: str, body
+    ):
+        """All POST endpoints with agent_id return 404 for unknown agents."""
+        url = path.format(agent_id=uuid4())
+        response = await client.post(url, json=body)
         assert response.status_code == 404
 
 
@@ -467,8 +509,45 @@ class TestAgentLocked:
         assert response.json()["detail"] == f"AgentLockedError: Agent {agent_record.id!r} did not become available within {LOCK_TIMEOUT_FAST}s"
 
 
-class TestCreateMemoryBlock:
+class _MemoryBlockEndpointBase:
+    """Base for memory block endpoint tests that patch a crud function and override get_agent_deps.
+    
+    Subclasses must define:
+    - crud_patch_target: str — the crud function to patch (e.g. "api.routes.create_block")
+    - crud_attr_name: str — attribute name for the mock (e.g. "mock_create_block")
+    
+    Provides:
+    - self.agent_record: The agent from agent_with_blocks
+    - self.blocks: The pre-existing blocks from agent_with_blocks
+    - self.mock_session: A mock session
+    - self.<crud_attr_name>: The mocked crud function
+    """
+    crud_patch_target: str
+    crud_attr_name: str
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, app: FastAPI, agent_with_blocks: dict):
+        """Common setup: override get_agent_deps, patch crud function, cleanup."""
+        self.agent_record = agent_with_blocks["agent"]
+        self.blocks = agent_with_blocks["blocks"]
+        self.mock_session = Mock()
+
+        async def _mock_dep():
+            yield make_deps(self.mock_session, self.agent_record)
+
+        app.dependency_overrides[get_agent_deps] = _mock_dep
+
+        with patch(self.crud_patch_target, new_callable=AsyncMock) as mock:
+            setattr(self, self.crud_attr_name, mock)
+            yield
+
+        app.dependency_overrides.pop(get_agent_deps)
+
+
+class TestCreateMemoryBlock(_MemoryBlockEndpointBase):
     """POST /agents/{agent_id}/memory/blocks — create a memory block."""
+    crud_patch_target = "api.routes.create_block"
+    crud_attr_name = "mock_create_block"
 
     _VALID_BODY = {
         "label": "notes",
@@ -477,33 +556,6 @@ class TestCreateMemoryBlock:
         "char_limit": 5000,
     }
     _MOCK_UPDATED_AT = datetime(2026, 1, 1, 12, 0, 0)
-
-    @pytest.fixture(autouse=True)
-    def mock_create_block_dep(self, app: FastAPI, agent_record: AgentRecord):
-        """Overrides get_agent_deps and patches create_block for all tests.
-
-        Provides self.configure_mock_get_agent_deps() to change dep behavior (e.g. raise
-        AgentNotFoundError for 404 tests). Default: yields a valid AgentDeps.
-        """
-        self.agent_record = agent_record
-        self.mock_session = Mock()
-
-        def _configure(raise_exc=None):
-            async def _mock_dep():
-                if raise_exc is not None:
-                    raise raise_exc
-                yield make_deps(self.mock_session, agent_record)
-                
-            app.dependency_overrides[get_agent_deps] = _mock_dep
-
-        self.configure_mock_get_agent_deps = _configure
-        _configure()  # default: happy path
-
-        with patch("api.routes.create_block", new_callable=AsyncMock) as mock:
-            self.mock_create_block = mock
-            yield
-
-        app.dependency_overrides.pop(get_agent_deps)
 
     async def test_calls_create_block_and_returns_201(self, client: AsyncClient):
         """Successful creation calls create_block and returns 201 with block data."""
@@ -521,38 +573,19 @@ class TestCreateMemoryBlock:
         self.mock_create_block.assert_called_once()
         assert MemoryBlockResponse.model_validate(response.json()) == MemoryBlockResponse.from_record(mock_block_record)
 
-    async def test_returns_404_for_unknown_agent(self, client: AsyncClient):
-        """
-        Returns 404 before calling create_block when agent does not exist.
-        Exception is propagated by the route and caught by app level handler
-        """
-        self.configure_mock_get_agent_deps(raise_exc=AgentNotFoundError(f"Agent not found"))
+    # 404 tested via parametrized TestNotFound
+    # 422 for Duplicate block handled by app level handler + test
 
-        response = await client.post(
-            f"/agents/{uuid4()}/memory/blocks",
-            json=self._VALID_BODY,
-        )
-
-        assert response.status_code == 404
-        self.mock_create_block.assert_not_called()
-
-    async def test_returns_400_for_duplicate_block(self, client: AsyncClient):
-        """
-        Returns 400 with label in detail when block label already exists.
-        This one is mapped internally by the route since this is the only place we expect it to occur....
-        
-        TODO: The above could be wrong, what if the agent tries to make a duplicate block with a tool call (future intended tool)?
-        Then handle_message could raise this exception! Consider moving to an app level handler like some of the others
-        """
-        self.mock_create_block.side_effect = DuplicateBlockError("block with label 'notes' already exists")
+    async def test_returns_422_for_invalid_settings(self, client: AsyncClient):
+        """Returns 422 when BlockSettings validation fails (e.g., char_limit <= 0)."""
+        invalid_body = {**self._VALID_BODY, "char_limit": 0}
 
         response = await client.post(
             f"/agents/{self.agent_record.id}/memory/blocks",
-            json=self._VALID_BODY,
+            json=invalid_body,
         )
 
-        assert response.status_code == 400
-        assert response.json()["detail"] == "Duplicate block: block with label 'notes' already exists"
+        assert response.status_code == 422
 
     async def test_returns_500_for_unexpected_error(self, client: AsyncClient):
         """
@@ -568,3 +601,199 @@ class TestCreateMemoryBlock:
 
         assert response.status_code == 500
         assert response.json()["detail"] == "RuntimeError: DB failure"
+
+
+class TestUpdateBlockContent(_MemoryBlockEndpointBase):
+    """PUT /agents/{agent_id}/memory/blocks/{label}/content — update block content."""
+    crud_patch_target = "api.routes.update_block"
+    crud_attr_name = "mock_update_block"
+
+    _UPDATED_CONTENT = "This is the new content."
+    _MOCK_UPDATED_AT = datetime(2026, 9, 10, 12, 0, 0)
+
+    async def test_calls_update_block_and_returns_200(self, client: AsyncClient):
+        """Successful update calls update_block and returns 200 with updated block."""
+        target_block = self.blocks[0]
+        # Mutate fixture to represent updated state (not persisted, just mock return value)
+        target_block.content = self._UPDATED_CONTENT
+        target_block.updated_at = self._MOCK_UPDATED_AT
+        self.mock_update_block.return_value = target_block
+
+        response = await client.put(
+            f"/agents/{self.agent_record.id}/memory/blocks/{target_block.label}/content",
+            json={"content": self._UPDATED_CONTENT},
+        )
+
+        assert response.status_code == 200
+        self.mock_update_block.assert_called_once()
+        call_args = self.mock_update_block.call_args
+        assert call_args.args[0].agent_id == self.agent_record.id
+        assert call_args.args[1] == target_block.label
+        assert call_args.args[2] == self._UPDATED_CONTENT
+        assert MemoryBlockResponse.model_validate(response.json()) == MemoryBlockResponse.from_record(target_block)
+
+    async def test_returns_404_for_unknown_label(self, client: AsyncClient):
+        """Returns 404 when block label doesn't exist for this agent."""
+        self.mock_update_block.side_effect = BlockNotFoundError("block not found")
+
+        response = await client.put(
+            f"/agents/{self.agent_record.id}/memory/blocks/nonexistent-label/content",
+            json={"content": "new content"},
+        )
+
+        assert response.status_code == 404
+        assert "not found" in response.json()["detail"].lower()
+
+    async def test_returns_422_for_content_over_limit(self, client: AsyncClient):
+        """Returns 422 when new content exceeds char_limit."""
+        self.mock_update_block.side_effect = ContentExceedsLimitError("new content exceeds char limit")
+
+        response = await client.put(
+            f"/agents/{self.agent_record.id}/memory/blocks/{self.blocks[0].label}/content",
+            json={"content": "x" * 100000},
+        )
+
+        assert response.status_code == 422
+        assert "char limit" in response.json()["detail"].lower()
+
+
+class TestGetBlockSettings(_MemoryBlockEndpointBase):
+    """GET /agents/{agent_id}/memory/blocks/{label}/settings — get block settings."""
+    crud_patch_target = "api.routes.get_block"
+    crud_attr_name = "mock_get_block"
+
+    async def test_returns_settings_for_existing_block(self, client: AsyncClient):
+        """Returns 200 with settings schema for existing block."""
+        target_block = self.blocks[0]
+        self.mock_get_block.return_value = target_block
+
+        response = await client.get(
+            f"/agents/{self.agent_record.id}/memory/blocks/{target_block.label}/settings",
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data == {
+            "label": target_block.label,
+            "description": target_block.description,
+            "char_limit": target_block.char_limit,
+            "position": target_block.position,
+        }
+
+    async def test_returns_404_for_unknown_label(self, client: AsyncClient):
+        """Returns 404 when block label doesn't exist for this agent."""
+        self.mock_get_block.return_value = None
+
+        response = await client.get(
+            f"/agents/{self.agent_record.id}/memory/blocks/nonexistent-label/settings",
+        )
+
+        assert response.status_code == 404
+        assert "not found" in response.json()["detail"].lower()
+
+
+class TestUpdateBlockSettings(_MemoryBlockEndpointBase):
+    """PUT /agents/{agent_id}/memory/blocks/{label}/settings — update block settings."""
+    crud_patch_target = "api.routes.update_block_settings"
+    crud_attr_name = "mock_update_block_settings"
+
+    async def test_calls_update_block_settings_and_returns_200(self, client: AsyncClient):
+        """Successful update calls update_block_settings and returns 200 with helper's output.
+        
+        Input and output intentionally differ to verify route returns the helper's result,
+        not just echoing the request. In practice they'd usually match, but the route's job
+        is to pass through whatever the helper returns.
+        """
+        target_block = self.blocks[0]
+        original_label = target_block.label
+        
+        # Request body — what the client sends
+        request_settings = {
+            "label": "renamed-block",
+            "description": "Updated description.",
+            "char_limit": 30000,
+            "position": 5,
+        }
+        
+        # Helper's return — intentionally different to prove route returns this, not request
+        target_block.label = request_settings["label"]
+        target_block.description = "Helper changed this description."  # Different!
+        target_block.char_limit = request_settings["char_limit"]
+        target_block.position = 99  # Different!
+        self.mock_update_block_settings.return_value = target_block
+
+        response = await client.put(
+            f"/agents/{self.agent_record.id}/memory/blocks/{original_label}/settings",
+            json=request_settings,
+        )
+
+        assert response.status_code == 200
+        # Verify route called helper with correct args
+        self.mock_update_block_settings.assert_called_once()
+        call_args = self.mock_update_block_settings.call_args
+        assert call_args.args[0].agent_id == self.agent_record.id  # deps
+        assert call_args.args[1] == original_label  # current label from URL
+        assert call_args.args[2] == BlockSettings(**request_settings)  # settings object
+        # Verify route returns helper's output (which differs from request)
+        assert response.json() == BlockSettings.from_record(target_block).model_dump()
+
+    async def test_returns_404_for_unknown_label(self, client: AsyncClient):
+        """Returns 404 when block label doesn't exist for this agent."""
+        self.mock_update_block_settings.side_effect = BlockNotFoundError("block not found")
+
+        response = await client.put(
+            f"/agents/{self.agent_record.id}/memory/blocks/nonexistent-label/settings",
+            json={"label": "nonexistent-label", "description": "new desc", "char_limit": 5000, "position": 0},
+        )
+
+        assert response.status_code == 404
+        assert "not found" in response.json()["detail"].lower()
+
+    async def test_returns_422_for_invalid_settings(self, client: AsyncClient):
+        """Returns 422 when BlockSettings validation fails (FastAPI request body validation)."""
+        target_block = self.blocks[0]
+        invalid_body = {"label": target_block.label, "description": "", "char_limit": 0, "position": 0}
+
+        response = await client.put(
+            f"/agents/{self.agent_record.id}/memory/blocks/{target_block.label}/settings",
+            json=invalid_body,
+        )
+
+        assert response.status_code == 422  # FastAPI validation
+
+
+class TestReorderBlocks(_MemoryBlockEndpointBase):
+    """Tests for PUT /agents/{agent_id}/memory/blocks/order"""
+
+    crud_patch_target = "api.routes.reorder_blocks"
+    crud_attr_name = "mock_reorder_blocks"
+
+    async def test_calls_reorder_blocks_and_returns_204(self, client: AsyncClient):
+        """Successful reorder calls reorder_blocks helper and returns 204 No Content."""
+        new_order = ["human", "persona", "system"]
+        self.mock_reorder_blocks.return_value = None  # reorder_blocks returns None
+
+        response = await client.put(
+            f"/agents/{self.agent_record.id}/memory/blocks/order",
+            json=new_order,
+        )
+
+        assert response.status_code == 204
+        assert response.content == b""  # No content
+        # Verify route called helper with correct args
+        self.mock_reorder_blocks.assert_called_once()
+        call_args = self.mock_reorder_blocks.call_args
+        assert call_args.args[0].agent_id == self.agent_record.id  # deps
+        assert call_args.args[1] == new_order  # labels in order
+
+    async def test_returns_422_for_invalid_label_list(self, client: AsyncClient):
+        """Returns 422 when label list doesn't match agent's blocks."""
+        self.mock_reorder_blocks.side_effect = InvalidBlockOrderListError("missing labels: {'system'}")
+
+        response = await client.put(
+            f"/agents/{self.agent_record.id}/memory/blocks/order",
+            json=["persona", "human"],  # missing "system". Note the input here doesn't really matter as the helper is mocked
+        )
+
+        assert response.status_code == 422
+        assert "missing labels" in response.json()["detail"]

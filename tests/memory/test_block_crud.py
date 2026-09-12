@@ -3,6 +3,8 @@ Tests for block CRUD (memory/block_crud.py)
 
 Read operations take (session, agent_id) — no lock required.
 Write operations take (deps) — proves caller holds per-agent lock.
+
+TODO: These should be grouped into test classes for consistency with rest of code base
 """
 import asyncio
 
@@ -11,18 +13,24 @@ import pytest_asyncio
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from agent.types import BlockSettings
 from conftest import make_deps, SAMPLE_AGENT_CONFIG
 from db.models import AgentRecord, MemoryBlockRecord
-from memory.block_crud import DuplicateBlockError
 
 from memory import block_crud
 from memory.block_crud import (
     get_blocks,
     get_block,
     update_block,
+    update_block_settings,
     create_block,
     delete_block,
     reorder_blocks,
+    BlockNotFoundError,
+    ContentExceedsLimitError,
+    DuplicateBlockError,
+    DuplicatePositionError,
+    InvalidBlockOrderListError,
 )
 
 
@@ -167,7 +175,7 @@ async def test_update_block_enforces_char_limit(multi_tenant_with_deps: dict):
     
     oversized_content = "x" * (human_block.char_limit + 1)
     
-    with pytest.raises(ValueError, match="new content exceeds char limit"):
+    with pytest.raises(ContentExceedsLimitError, match="new content exceeds char limit"):
         await update_block(deps, "human", oversized_content)
 
 
@@ -186,13 +194,96 @@ async def test_update_block_accepts_prefetched_block(multi_tenant_with_deps: dic
     spy.assert_not_called()
 
 
+class TestUpdateBlockSettings:
+    """Tests for update_block_settings helper."""
+    
+    @pytest_asyncio.fixture(autouse=True)
+    async def setup(self, multi_tenant_with_deps: dict):
+        """Common setup: extract deps and target block."""
+        self.deps = multi_tenant_with_deps["deps_a"]
+        self.blocks = multi_tenant_with_deps["blocks_a"]
+        self.target = self.blocks[0]  # persona at position 0
+    
+    async def test_modifies_all_fields(self):
+        """update_block_settings should update label, description, char_limit, and position."""
+        original_label = self.target.label
+        
+        new_settings = BlockSettings(
+            label="persona_renamed",
+            description="New description",
+            char_limit=5000,
+            position=99,
+        )
+        result = await update_block_settings(self.deps, original_label, new_settings)
+        
+        # Return value matches expected settings
+        assert BlockSettings.from_record(result) == new_settings
+        
+        # Old label gone, new label exists with correct settings
+        assert await get_block(self.deps.session, self.deps.agent_id, original_label) is None
+        fetched = await get_block(self.deps.session, self.deps.agent_id, "persona_renamed")
+        assert BlockSettings.from_record(fetched) == new_settings
+
+    async def test_position_none_keeps_current(self):
+        """When settings.position is None, should keep the block's current position."""
+        original_position = self.target.position
+        
+        new_settings = BlockSettings(
+            label=self.target.label,
+            description="Changed description",
+            char_limit=self.target.char_limit,
+            position=None,  # Explicitly None — should keep current
+        )
+        result = await update_block_settings(self.deps, self.target.label, new_settings)
+        
+        # Position preserved, other fields updated
+        expected = new_settings.model_copy(update={"position": original_position})
+        assert BlockSettings.from_record(result) == expected
+        
+        # DB matches
+        fetched = await get_block(self.deps.session, self.deps.agent_id, self.target.label)
+        assert BlockSettings.from_record(fetched) == expected
+
+    async def test_duplicate_label_raises(self):
+        """Renaming to an existing label should raise DuplicateBlockError."""
+        # Try to rename "persona" to "human" (which exists)
+        new_settings = BlockSettings(label="human", description="", char_limit=20000)
+        
+        with pytest.raises(DuplicateBlockError):
+            await update_block_settings(self.deps, "persona", new_settings)
+
+    async def test_duplicate_position_raises(self):
+        """Setting position to one already used should raise DuplicatePositionError."""
+        # "persona" is at position 0, "human" is at position 1
+        # Try to move "human" to position 0
+        new_settings = BlockSettings(label="human", description="", char_limit=20000, position=0)
+        
+        with pytest.raises(DuplicatePositionError):
+            await update_block_settings(self.deps, "human", new_settings)
+
+    async def test_rejects_char_limit_below_content_length(self):
+        """Reducing char_limit below current content length should raise ContentExceedsLimitError."""
+        # First, put some content in the block
+        await update_block(self.deps, self.target.label, "x" * 100)
+        
+        # Now try to reduce char_limit below content length — should fail
+        new_settings = BlockSettings(
+            label=self.target.label,
+            description=self.target.description,
+            char_limit=10,  # Less than 100 chars of content
+        )
+        
+        with pytest.raises(ContentExceedsLimitError):
+            await update_block_settings(self.deps, self.target.label, new_settings)
+
+
 # --- create_block tests ---
 
 async def test_create_block_inserts_with_defaults(multi_tenant_with_deps: dict):
     """create_block with minimal args should use correct defaults."""
     deps = multi_tenant_with_deps["deps_a"]
     
-    result = await create_block(deps, label="notes", content="Some notes")
+    result = await create_block(deps, BlockSettings(label="notes"), content="Some notes")
 
     assert result.label == "notes"
     assert result.content == "Some notes"
@@ -211,7 +302,7 @@ async def test_create_block_with_duplicate_label_raises(multi_tenant_with_deps: 
     
     # "persona" already exists from fixture
     with pytest.raises(DuplicateBlockError, match="already exists"):
-        await create_block(deps, label="persona", content="Duplicate!")
+        await create_block(deps, BlockSettings(label="persona"), content="Duplicate!")
 
 
 async def test_create_block_auto_assigns_position_at_end(multi_tenant_with_deps: dict):
@@ -220,7 +311,7 @@ async def test_create_block_auto_assigns_position_at_end(multi_tenant_with_deps:
     existing_blocks = multi_tenant_with_deps["blocks_a"]
     max_existing_position = max(b.position for b in existing_blocks)
     
-    result = await create_block(deps, label="notes")
+    result = await create_block(deps, BlockSettings(label="notes"))
     
     assert result.position == max_existing_position + 1
 
@@ -228,7 +319,7 @@ async def test_create_block_auto_assigns_position_at_end(multi_tenant_with_deps:
 async def test_create_block_on_agent_with_no_blocks(session: AsyncSession, agent_record: AgentRecord):
     """create_block on agent with no blocks should assign position 0."""
     deps = make_deps(session, agent_record)
-    result = await create_block(deps, label="first_block")
+    result = await create_block(deps, BlockSettings(label="first_block"))
     assert result.position == 0
 
 
@@ -236,7 +327,7 @@ async def test_create_block_with_explicit_position(multi_tenant_with_deps: dict)
     """create_block with explicit position should use that position."""
     deps = multi_tenant_with_deps["deps_a"]
     
-    result = await create_block(deps, label="notes", position=99)
+    result = await create_block(deps, BlockSettings(label="notes", position=99))
     
     assert result.position == 99
 
@@ -247,7 +338,7 @@ async def test_create_block_with_duplicate_position_raises(multi_tenant_with_dep
     
     # Position 0 already taken by "persona" from fixture
     with pytest.raises(IntegrityError):
-        await create_block(deps, label="notes", position=0)
+        await create_block(deps, BlockSettings(label="notes", position=0))
 
 
 # --- delete_block tests ---
@@ -271,13 +362,14 @@ async def test_delete_block_removes_block(multi_tenant_with_deps: dict):
 
 @pytest.mark.parametrize("operation,args", [
     pytest.param(update_block, ("nonexistent", "content"), id="update_block"),
+    pytest.param(update_block_settings, ("nonexistent", BlockSettings(label="new")), id="update_block_settings"),
     pytest.param(delete_block, ("nonexistent",), id="delete_block"),
 ])
 async def test_write_op_raises_on_nonexistent_block(multi_tenant_with_deps: dict, operation, args):
-    """Write operations should raise ValueError when block doesn't exist."""
+    """Write operations should raise BlockNotFoundError when block doesn't exist."""
     deps = multi_tenant_with_deps["deps_a"]
     
-    with pytest.raises(ValueError, match="block not found"):
+    with pytest.raises(BlockNotFoundError, match="not found"):
         await operation(deps, *args)
 
 
@@ -310,7 +402,7 @@ async def test_reorder_blocks_validates_label_list(multi_tenant_with_deps: dict,
     """reorder_blocks should reject lists that don't exactly match agent's blocks."""
     deps = multi_tenant_with_deps["deps_a"]
     
-    with pytest.raises(ValueError, match=error_match):
+    with pytest.raises(InvalidBlockOrderListError, match=error_match):
         await reorder_blocks(deps, incomplete_list)
 
 
@@ -333,9 +425,10 @@ async def test_write_operations_respect_agent_isolation(multi_tenant_with_deps: 
     
     # Perform all write operations on Agent A
     await update_block(deps_a, "persona", "Modified A's persona")
-    await create_block(deps_a, label="new_block", content="New for A")
+    await update_block_settings(deps_a, "human", BlockSettings(label="human_renamed", description="new desc", char_limit=5000))
+    await create_block(deps_a, BlockSettings(label="new_block"), content="New for A")
     await delete_block(deps_a, "system")  # Agent A has system block
-    await reorder_blocks(deps_a, ["human", "persona", "new_block"])
+    await reorder_blocks(deps_a, ["human_renamed", "persona", "new_block"])
     # All writes commit via deps_a's session, which expires ALL records in the session (including deps_b's)
     # In prod, seperate agents have seperate sessions
     await deps_b.session.refresh(deps_b._agent_record)
@@ -351,7 +444,8 @@ async def test_write_operations_respect_agent_isolation(multi_tenant_with_deps: 
 
 @pytest.mark.parametrize("write_op,call_args,returns_record", [
     pytest.param(update_block, ("persona", "new content"), True, id="update_block"),
-    pytest.param(create_block, ("new_block",), True, id="create_block"),
+    pytest.param(update_block_settings, ("persona", BlockSettings(label="persona_new", description="new")), True, id="update_block_settings"),
+    pytest.param(create_block, (BlockSettings(label="new_block"),), True, id="create_block"),
     pytest.param(delete_block, ("persona",), False, id="delete_block"),
     pytest.param(reorder_blocks, (["system", "human", "persona"],), False, id="reorder_blocks"),
 ])
@@ -381,8 +475,15 @@ async def test_write_ops_commit_and_refresh_by_default(multi_tenant_with_deps, w
         id="update_block",
     ),
     pytest.param(
+        update_block_settings,
+        ("persona", BlockSettings(label="persona_renamed", description="new desc")),
+        lambda deps: get_block(deps.session, deps.agent_id, "persona_renamed"),
+        lambda block: block is not None and block.description == "new desc",
+        id="update_block_settings",
+    ),
+    pytest.param(
         create_block,
-        ("new_block",),
+        (BlockSettings(label="new_block"),),
         lambda deps: get_block(deps.session, deps.agent_id, "new_block"),
         lambda block: block is not None,
         id="create_block",

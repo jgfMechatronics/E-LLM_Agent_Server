@@ -9,6 +9,7 @@ from unittest.mock import patch, AsyncMock, MagicMock
 from httpx import ASGITransport, AsyncClient
 
 from agent.factory import AgentLockedError, AgentNotFoundError
+from memory.block_crud import BlockNotFoundError, DuplicateBlockError, DuplicatePositionError
 from api.app import _create_app
 from api.routes import router
 from tests.conftest import TEST_BASE_URL
@@ -120,6 +121,18 @@ class TestExceptionHandlers(_BaseAppClientTest):
         async def _raise_locked():
             raise AgentLockedError("agent 'x' is locked")
 
+        @self.app.get("/test-block-not-found")
+        async def _raise_block_not_found():
+            raise BlockNotFoundError("block 'y' not found")
+
+        @self.app.get("/test-duplicate-block")
+        async def _raise_duplicate_block():
+            raise DuplicateBlockError("block 'z' already exists")
+
+        @self.app.get("/test-duplicate-position")
+        async def _raise_duplicate_position():
+            raise DuplicatePositionError("position 0 already held")
+
         @self.app.get("/test-unexpected")
         async def _raise_unexpected():
             raise RuntimeError("something broke")
@@ -127,12 +140,15 @@ class TestExceptionHandlers(_BaseAppClientTest):
     @pytest.mark.parametrize("path,expected_status,error_msg", [
         ("/test-not-found", 404, "AgentNotFoundError: agent 'x' not found"),
         ("/test-locked", 423, "AgentLockedError: agent 'x' is locked"),
+        ("/test-block-not-found", 404, "BlockNotFoundError: block 'y' not found"),
+        ("/test-duplicate-block", 422, "DuplicateBlockError: block 'z' already exists"),
+        ("/test-duplicate-position", 422, "DuplicatePositionError: position 0 already held"),
         ("/test-unexpected", 500, "RuntimeError: something broke"),
     ])
     async def test_maps_domain_exception_to_http(
         self, path: str, expected_status: int, error_msg: str
     ):
-        """AgentNotFoundError → 404, AgentLockedError → 423 with detail string."""
+        """Domain exceptions map to appropriate HTTP status codes with detail string."""
         response = await self.client.get(path)
         assert response.status_code == expected_status
         assert response.json()["detail"] == error_msg

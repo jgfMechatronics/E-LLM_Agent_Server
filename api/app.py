@@ -14,6 +14,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from agent.factory import AgentLockedError, AgentNotFoundError
+from memory.block_crud import BlockNotFoundError, DuplicateBlockError, DuplicatePositionError
 from api.routes import router
 from api.schemas import HealthResponse
 from db.connection import create_sqlite_engine, init_db
@@ -106,6 +107,18 @@ async def agent_locked_handler(request: Request, exc: AgentLockedError) -> JSONR
     return JSONResponse(status_code=423, content={"detail": _exc_detail(exc)})
 
 
+async def block_not_found_handler(request: Request, exc: BlockNotFoundError) -> JSONResponse:
+    return JSONResponse(status_code=404, content={"detail": _exc_detail(exc)})
+
+
+async def duplicate_block_handler(request: Request, exc: DuplicateBlockError) -> JSONResponse:
+    return JSONResponse(status_code=422, content={"detail": _exc_detail(exc)})
+
+
+async def duplicate_position_handler(request: Request, exc: DuplicatePositionError) -> JSONResponse:
+    return JSONResponse(status_code=422, content={"detail": _exc_detail(exc)})
+
+
 # Since this app is intended for self hosters, we want exception details to pass on to the client
 async def unexpected_error_handler(request: Request, exc: Exception) -> JSONResponse:
     return JSONResponse(status_code=500, content={"detail": _exc_detail(exc)})
@@ -118,6 +131,9 @@ def _create_app() -> FastAPI:
     app.include_router(router)
     app.add_exception_handler(AgentNotFoundError, agent_not_found_handler)
     app.add_exception_handler(AgentLockedError, agent_locked_handler)
+    app.add_exception_handler(BlockNotFoundError, block_not_found_handler)
+    app.add_exception_handler(DuplicateBlockError, duplicate_block_handler)
+    app.add_exception_handler(DuplicatePositionError, duplicate_position_handler)
     app.add_exception_handler(Exception, unexpected_error_handler)
     # Prevent DNS rebinding (validates Host header)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=_ALLOWED_HOSTS)

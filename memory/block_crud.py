@@ -17,9 +17,10 @@ to be read only BUT they do still get a full session. Is there a such thing as a
 from collections.abc import Sequence
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from agent.types import AgentDeps
+from agent.types import AgentDeps, BlockSettings
 from db.models import MemoryBlockRecord
 
 
@@ -27,6 +28,22 @@ from db.models import MemoryBlockRecord
 
 class DuplicateBlockError(Exception):
     """Raised when attempting to create a block with a label that already exists for the agent."""
+
+
+class BlockNotFoundError(Exception):
+    """Raised when a block with the given label doesn't exist for the agent."""
+
+
+class ContentExceedsLimitError(Exception):
+    """Raised when new content exceeds the block's char_limit."""
+
+
+class InvalidBlockOrderListError(Exception):
+    """Raised when the label list for reorder doesn't match the agent's blocks."""
+
+
+class DuplicatePositionError(Exception):
+    """Raised when attempting to set a block's position to one already held by another block."""
 
 
 # --- Internal helpers ---
@@ -68,6 +85,21 @@ async def get_block(session: AsyncSession, agent_id: str, label: str) -> MemoryB
     return result.scalars().one_or_none()
 
 
+async def get_block_or_raise(session: AsyncSession, agent_id: str, label: str) -> MemoryBlockRecord:
+    """Load single block by label. Raises BlockNotFoundError if not found."""
+    block = await get_block(session, agent_id, label)
+    if block is None:
+        raise BlockNotFoundError(f"block with label '{label}' not found")
+    return block
+
+
+async def raise_if_label_exists(session: AsyncSession, agent_id: str, label: str) -> None:
+    """Raise DuplicateBlockError if a block with this label already exists."""
+    existing = await get_block(session, agent_id, label)
+    if existing is not None:
+        raise DuplicateBlockError(f"block with label '{label}' already exists")
+
+
 # --- Write operations (require deps → lock held) ---
 
 async def update_block(
@@ -86,12 +118,10 @@ async def update_block(
     already has it
     """
     if block is None:
-        block = await get_block(deps.session, deps.agent_id, label)
-        if block is None:
-            raise ValueError("block not found")
+        block = await get_block_or_raise(deps.session, deps.agent_id, label)
 
     if len(content) > block.char_limit:
-        raise ValueError("new content exceeds char limit")
+        raise ContentExceedsLimitError("new content exceeds char limit")
 
     block.content = content
     await _persist(deps, commit, block)
@@ -100,25 +130,20 @@ async def update_block(
 
 async def create_block(
     deps: AgentDeps,
-    label: str,
+    settings: BlockSettings,
     content: str = "",
-    description: str = "",
-    char_limit: int = 20000,
-    position: int | None = None,
     commit: bool = True,
 ) -> MemoryBlockRecord:
     """
     Create new block.
     
-    If position is None, appends to end (max existing position + 1).
+    If settings.position is None, appends to end (max existing position + 1).
     Raises if label already exists for this agent.
     """
-    # Check for duplicate label
-    existing = await get_block(deps.session, deps.agent_id, label)
-    if existing is not None:
-        raise DuplicateBlockError(f"block with label '{label}' already exists")
+    await raise_if_label_exists(deps.session, deps.agent_id, settings.label)
 
     # Auto-assign position if not specified
+    position = settings.position
     if position is None:
         stmt = select(func.max(MemoryBlockRecord.position)).where(
             MemoryBlockRecord.agent_id == deps.agent_id
@@ -129,10 +154,10 @@ async def create_block(
 
     block = MemoryBlockRecord(
         agent_id=deps.agent_id,
-        label=label,
+        label=settings.label,
         content=content,
-        description=description,
-        char_limit=char_limit,
+        description=settings.description,
+        char_limit=settings.char_limit,
         position=position,
     )
     deps.session.add(block)
@@ -142,10 +167,7 @@ async def create_block(
 
 async def delete_block(deps: AgentDeps, label: str, commit: bool = True) -> None:
     """Remove block. Raises if block doesn't exist (fail loudly)."""
-    block = await get_block(deps.session, deps.agent_id, label)
-    if block is None:
-        raise ValueError("block not found")
-
+    block = await get_block_or_raise(deps.session, deps.agent_id, label)
     await deps.session.delete(block)
     await _persist(deps, commit)
 
@@ -169,7 +191,7 @@ async def reorder_blocks(deps: AgentDeps, labels_in_order: list[str], commit: bo
             errors.append(f"missing labels: {missing}")
         if unknown:
             errors.append(f"unknown labels: {unknown}")
-        raise ValueError("; ".join(errors))
+        raise InvalidBlockOrderListError("; ".join(errors))
 
     # Build label -> block map for efficient lookup
     blocks_by_label = {b.label: b for b in blocks}
@@ -184,3 +206,53 @@ async def reorder_blocks(deps: AgentDeps, labels_in_order: list[str], commit: bo
         blocks_by_label[label].position = position
 
     await _persist(deps, commit)
+
+
+async def update_block_settings(
+    deps: AgentDeps,
+    label: str,
+    settings: BlockSettings,
+    commit: bool = True,
+) -> MemoryBlockRecord:
+    """
+    Update block settings (label, description, char_limit, position).
+    
+    Args:
+        deps: Agent dependencies (proves caller holds lock)
+        label: Current label of block to update (from URL path)
+        settings: New settings to apply (settings.label may differ for rename)
+        commit: Whether to commit transaction
+    
+    If settings.position is None, keeps the current position (no change).
+    
+    Raises BlockNotFoundError if block doesn't exist.
+    Raises DuplicateBlockError if renaming to a label that already exists.
+    Raises DuplicatePositionError if setting position to one already held by another block.
+    """
+    block = await get_block_or_raise(deps.session, deps.agent_id, label)
+    
+    # Check for label conflict on rename (before mutations)
+    if settings.label != label:
+        await raise_if_label_exists(deps.session, deps.agent_id, settings.label)
+    
+    if settings.char_limit < len(block.content):
+        raise ContentExceedsLimitError("new char_limit is less than current content length")
+    
+    # Apply mutations
+    block.label = settings.label
+    block.description = settings.description
+    block.char_limit = settings.char_limit
+    if settings.position is not None:
+        block.position = settings.position
+
+    try:
+        await _persist(deps, commit, block)
+    except IntegrityError as e:
+        # Label conflict already checked above; check for position conflict
+        if "UNIQUE constraint failed: memory_block.agent_id, memory_block.position" in str(e):
+            raise DuplicatePositionError(
+                f"position {settings.position} already held by another block"
+            ) from e
+        raise  # Re-raise unexpected IntegrityErrors
+    
+    return block

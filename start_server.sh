@@ -7,6 +7,7 @@ ENV_FILE="$SCRIPT_DIR/.env"
 PID_FILE="/tmp/ellm-server.pid"
 LOG_FILE="/tmp/uvicorn.log"
 ERR_FILE="/tmp/uvicorn.err"
+PORT=8008
 
 # Load .env if present
 if [[ -f "$ENV_FILE" ]]; then
@@ -18,7 +19,7 @@ if [[ -f "$ENV_FILE" ]]; then
 fi
 
 # create default dir for db
-DEFAULT_DB_DIR="$HOME/.agent-home"
+DEFAULT_DB_DIR="$HOME/agent-home"
 if [[ ! -d "$DEFAULT_DB_DIR" ]]; then
     mkdir -p "$DEFAULT_DB_DIR"
     echo "created $DEFAULT_DB_DIR"
@@ -39,7 +40,7 @@ fi
 # Start server
 cd "$SCRIPT_DIR"
 echo "Starting server... stdout: $LOG_FILE  stderr: $ERR_FILE"
-nohup uv run uvicorn main:app --host 127.0.0.1 --port 8000 > "$LOG_FILE" 2> "$ERR_FILE" &
+nohup uv run uvicorn main:app --host 127.0.0.1 --port "$PORT" > "$LOG_FILE" 2> "$ERR_FILE" &
 echo $! > "$PID_FILE"
 echo "Server started (PID $(cat "$PID_FILE"))"
 
@@ -48,7 +49,7 @@ TIMEOUT=15
 ELAPSED=0
 echo "Waiting for server to become healthy..."
 while [[ $ELAPSED -lt $TIMEOUT ]]; do
-    if curl -s http://localhost:8000/health > /dev/null 2>&1; then
+    if curl -s "http://localhost:$PORT/health" > /dev/null 2>&1; then
         echo "Server is healthy!"
         exit 0
     fi

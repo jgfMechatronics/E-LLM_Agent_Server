@@ -15,7 +15,7 @@ from pydantic_ai.tools import Tool
 from pydantic_ai.exceptions import ModelRetry
 
 from agent.types import AgentDeps
-from memory.block_crud import get_block, update_block
+from memory.block_crud import get_block, update_block, ContentExceedsLimitError
 
 
 def _get_edit_line_info(content: str, edit_start_idx: int, new_text: str) -> tuple[int, int]:
@@ -148,7 +148,7 @@ async def memory_replace(
     # handles char limit check and persistence
     try:
         await update_block(deps, label, new_content, commit=False, block=block)
-    except ValueError as e:
+    except ContentExceedsLimitError as e:
         raise ModelRetry(str(e))
     
     # Compute and return snippet
@@ -206,7 +206,7 @@ async def memory_insert(
     # handles char limit check and persistence
     try:
         await update_block(deps, label, new_content, commit=False, block=block)
-    except ValueError as e:
+    except ContentExceedsLimitError as e:
         raise ModelRetry(str(e))
     
     return _compute_snippet(new_content, insert_pos, content)

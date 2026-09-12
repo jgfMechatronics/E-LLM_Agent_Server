@@ -15,12 +15,13 @@ from typing import Any, AsyncGenerator
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.sse import EventSourceResponse, ServerSentEvent
+from pydantic import ValidationError
 from pydantic_ai import Agent, AgentRunResultEvent
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent.crud import agent_exists, create_agent_record, get_agent_record, get_all_agents, replace_agent_config, replace_system_instructions
-from agent.types import AgentAppState, AgentConfig, AgentDeps
+from agent.types import AgentAppState, AgentConfig, AgentDeps, BlockSettings
 from agent.runner import run_stateful_agent
 from api.fastapi_deps import get_session_dep, get_agent_and_deps, get_agent_app_state_reg, get_agent_deps
 from api.schemas import (
@@ -32,8 +33,18 @@ from api.schemas import (
     MessageRequest,
     MessagesResponse,
     SystemInstructionsResponse,
+    UpdateBlockContentRequest,
 )
-from memory.block_crud import DuplicateBlockError, create_block, get_blocks
+from memory.block_crud import (
+    ContentExceedsLimitError,
+    InvalidBlockOrderListError,
+    create_block,
+    get_block,
+    get_blocks,
+    reorder_blocks,
+    update_block,
+    update_block_settings,
+)
 from memory.system_prompt_compilation import compile_system_prompt
 from messages.messages import load_messages
 
@@ -212,6 +223,19 @@ async def get_memory_blocks(
     return CoreMemoryResponse(blocks=[MemoryBlockResponse.from_record(b) for b in blocks])
 
 
+@router.get("/{agent_id}/memory/blocks/{label}")
+async def get_memory_block(
+    agent_id: str,
+    label: str,
+    session: AsyncSession = Depends(get_session_dep),
+) -> MemoryBlockResponse:
+    """Return a single memory block by label."""
+    block = await get_block(session, agent_id, label)
+    if block is None:
+        raise HTTPException(status_code=404, detail=f"Block {label!r} not found")
+    return MemoryBlockResponse.from_record(block)
+
+
 @router.post("/{agent_id}/memory/blocks", status_code=201)
 async def create_memory_block(
     agent_id: str,
@@ -220,10 +244,68 @@ async def create_memory_block(
 ) -> MemoryBlockResponse:
     """Create a new memory block for an agent."""
     try:
-        block = await create_block(deps, body.label, body.content, body.description, body.char_limit)
-    except DuplicateBlockError as e:
-        raise HTTPException(status_code=400, detail=f"Duplicate block: {e}") from e
+        settings = BlockSettings(
+            label=body.label,
+            description=body.description,
+            char_limit=body.char_limit,
+        )
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=f"Invalid block settings: {e}") from e
+    block = await create_block(deps, settings, body.content)
     return MemoryBlockResponse.from_record(block)
+
+
+@router.put("/{agent_id}/memory/blocks/{label}/content")
+async def update_block_content(
+    agent_id: str,
+    label: str,
+    body: UpdateBlockContentRequest,
+    deps: AgentDeps = Depends(get_agent_deps),
+) -> MemoryBlockResponse:
+    """Update the content of a memory block."""
+    try:
+        block = await update_block(deps, label, body.content)
+    except ContentExceedsLimitError as e:
+        raise HTTPException(status_code=422, detail=f"Content exceeds char limit") from e
+    return MemoryBlockResponse.from_record(block)
+
+
+@router.get("/{agent_id}/memory/blocks/{label}/settings")
+async def get_block_settings(
+    agent_id: str,
+    label: str,
+    session: AsyncSession = Depends(get_session_dep),
+) -> BlockSettings:
+    """Get settings/metadata for a memory block."""
+    block = await get_block(session, agent_id, label)
+    if block is None:
+        raise HTTPException(status_code=404, detail=f"Block {label!r} not found")
+    return BlockSettings.from_record(block)
+
+
+@router.put("/{agent_id}/memory/blocks/{label}/settings")
+async def put_block_settings(
+    agent_id: str,
+    label: str,
+    settings: BlockSettings,
+    deps: AgentDeps = Depends(get_agent_deps),
+) -> BlockSettings:
+    """Update settings/metadata for a memory block."""
+    block = await update_block_settings(deps, label, settings)
+    return BlockSettings.from_record(block)
+
+
+@router.put("/{agent_id}/memory/blocks/order", status_code=204)
+async def put_block_order(
+    agent_id: str,
+    labels_in_order: list[str],
+    deps: AgentDeps = Depends(get_agent_deps),
+) -> None:
+    """Reorder memory blocks by specifying labels in desired order."""
+    try:
+        await reorder_blocks(deps, labels_in_order)
+    except InvalidBlockOrderListError as e:
+        raise HTTPException(status_code=422, detail=str(e))
 
 
 @router.post("/{agent_id}/cancel", status_code=202)

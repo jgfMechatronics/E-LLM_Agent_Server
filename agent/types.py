@@ -10,14 +10,14 @@ from datetime import datetime
 
 from typing import Literal, get_args, get_origin
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic_ai.models.anthropic import AnthropicModelName
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
-    from db.models import AgentRecord
+    from db.models import AgentRecord, MemoryBlockRecord
 
 
 # AnthropicModelName is str | Literal['claude-...', ...]. Extract only the known
@@ -115,6 +115,30 @@ class AgentConfig(BaseModel):
         if v < 0:
             raise ValueError("retries must be non-negative")
         return v
+
+
+class BlockSettings(BaseModel):
+    """Settings/metadata for a memory block (excludes content and timestamps).
+    
+    Used for both API requests/responses and as helper function parameter.
+    Shared type so API layer and data layer speak the same language.
+    
+    Defaults align with create_block's defaults so BlockSettings() with just a label
+    produces the same behavior as the old create_block(label=...) call.
+    """
+    label: str = Field(min_length=1)
+    description: str = ""
+    char_limit: int = Field(default=20000, gt=0)
+    position: int | None = Field(default=None, ge=0)
+
+    @classmethod
+    def from_record(cls, block: "MemoryBlockRecord") -> "BlockSettings":
+        return cls(
+            label=block.label,
+            description=block.description,
+            char_limit=block.char_limit,
+            position=block.position,
+        )
 
 
 @dataclass(init=False)

@@ -38,6 +38,10 @@ class CreateMemoryBlockRequest(BaseModel):
     char_limit: int = 20000
 
 
+class UpdateBlockContentRequest(BaseModel):
+    content: str
+
+
 # --- Response Schemas ---
 
 class AgentMetadataResponse(BaseModel):
